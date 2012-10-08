@@ -15,6 +15,9 @@
 """
 from __future__ import with_statement
 
+CHUNK_SIZE = 1000
+LOCALHOST = 'localhost'
+
 __author__ = 'David Marin <dave@yelp.com>'
 __version__ = '0.1'
 
@@ -31,15 +34,21 @@ import subprocess
 import sys
 import tempfile
 import time
+import collections
 
 import boto
 import boto.pyami.config
+try:
+    import simplejson as json  # preferred because of C speedups
+except ImportError:
+    import json  # built in to Python 2.6 and later
 
 
 log = logging.getLogger('s3mysqldump')
 
 
 DEFAULT_MYSQLDUMP_BIN = 'mysqldump'
+DEFAULT_MYSQL_BIN = 'mysql'
 
 SINGLE_ROW_FORMAT_OPTS = [
     # --skip-opt causes out of memory error on 5.0.91, so do explicitly instead
@@ -71,7 +80,7 @@ def main(args):
     :param list args: alternate command line arguments (normally we read from
                       ``sys.argv[:1]``)
     """
-    databases, tables, s3_uri_format, options = parse_args(args)
+    databases, tables, s3_uri_format, options, job_config = parse_args(args)
 
     now = get_current_time(utc=options.utc)
 
@@ -84,34 +93,93 @@ def main(args):
     extra_opts = parse_opts(options.mysqldump_extra_opts)
 
     # helper function, to call once, or once per table, below
-    def mysqldump_to_s3(s3_uri, databases=None, tables=None):
+    def mysqldump_to_s3(s3_uri, databases=None, tables=None, job_config = None):
         if not options.force and s3_key_exists(s3_conn, s3_uri):
             log.warn('%s already exists; use --force to overwrite' % (s3_uri,))
             return
-
         log.info('dumping %s -> %s' % (dump_desc(databases, tables), s3_uri))
-        with tempfile.NamedTemporaryFile(prefix='s3mysqldump-') as file:
+
+        if options.custom_out_dir and not options.header_output:
+            extra_opts.append('--tab='+options.custom_out_dir)
+            fn = options.custom_out_dir
+            fp = None
+        else:
+            fp, fn = tempfile.mkstemp(prefix='s3mysqldump-', dir='.')
+
+        # Defaults to 'id'
+        check_column = options.check_column
+        if job_config and job_config.has_key(table):
+            options.last_value = job_config[table]["last_value"]
+
+        if options.header_output:
+            output_db_table_columns(databases, tables, fn, my_cnf = options.my_cnf, host=options.db_host)
+            success = True
+        elif options.convert_to_json:
+            output_db_to_json(databases, tables, fn, my_cnf = options.my_cnf, host=options.db_host, incremental=options.incremental,
+                check_column = check_column,
+                last_value = options.last_value)
+            success = True
+        else:
+
+            if options.last_value and not options.use_mysql:
+                extra_opts.append('--where='+check_column+'>'+str(options.last_value))
+
+            if options.use_mysql:
+                exe = options.mysql_bin
+            else:
+                exe = options.mysqldump_bin
+
             # dump to a temp file
             success = mysqldump_to_file(
-                file, databases, tables,
-                mysqldump_bin=options.mysqldump_bin,
+                fp, databases, tables,
+                host=options.db_host,
+                exe=exe,
+                use_mysql=options.use_mysql,
                 my_cnf=options.my_cnf,
                 extra_opts=extra_opts,
+                custom_mysql_query=options.custom_mysql_query,
+                incremental=options.incremental,
+                check_column = options.check_column,
+                last_value = options.last_value,
+                post_proc_script = options.post_proc_script,
                 single_row_format=options.single_row_format)
+        del fp
+        if success:
+            upload = True
+        # For tab output case..
+            if not os.path.isfile(fn):
+                fn+="/"+tables[0]+".txt"
 
-            # upload to S3 (if mysqldump worked!)
-            if success:
-                log.debug('  %s -> %s' % (file.name, s3_uri))
+            if options.dry_run:
+                upload = False
+                log.info('Not uploading file to s3 as --dry-run was specified.')
+            if options.job:
+                with open(options.job,'w') as fp:
+                    upload = update_job_config(fn, job_config, tables, fp)
+
+            if upload:
+                if options.compress:
+                    log.info('Compressing file before uploading: %s -> %s'%(fn, fn+".gz"))
+                    compress_file(fn)
+                    os.remove(fn)
+                    fn+=".gz"
+
+                log.debug('  %s -> %s' % (fn, s3_uri))
                 start = time.time()
 
                 s3_key = make_s3_key(s3_conn, s3_uri)
-                if os.path.getsize(file.name) > S3_MAX_PUT_SIZE:
-                    upload_multipart(s3_key, file.name)
+                if os.path.getsize(fn) > S3_MAX_PUT_SIZE:
+                    upload_multipart(s3_key, fn)
                 else:
-                    log.debug('Upload to %r' % s3_key)
-                    s3_key.set_contents_from_file(file)
+                    with open(fn) as fp:
+                        log.debug('Upload to %r' % s3_key)
+                        s3_key.set_contents_from_file(fp)
 
                 log.debug('  Done in %.1fs' % (time.time() - start))
+
+        if os.path.isfile(fn):
+            log.info('Removing mysqldump local output file -- %s'%fn)
+            os.remove(fn)
 
     # output to separate files, if specified by %T and %D
     if has_table_field(s3_uri_format):
@@ -119,15 +187,146 @@ def main(args):
         database = databases[0]
         for table in tables:
             s3_uri = resolve_s3_uri_format(s3_uri_format, now, database, table)
-            mysqldump_to_s3(s3_uri, [database], [table])
+            mysqldump_to_s3(s3_uri, [database], [table], job_config)
     elif has_database_field(s3_uri_format):
         for database in databases:
             s3_uri = resolve_s3_uri_format(s3_uri_format, now, database)
-            mysqldump_to_s3(s3_uri, [database], tables)
+            mysqldump_to_s3(s3_uri, [database], tables, job_config)
     else:
         s3_uri = resolve_s3_uri_format(s3_uri_format, now)
-        mysqldump_to_s3(s3_uri, databases, tables)
+        mysqldump_to_s3(s3_uri, databases, tables, job_config)
 
+def update_job_config(fn, job_config, tables, fp):
+    table = tables[0]
+    upload = True
+    if fp:
+        #Contains quotes
+        try:
+            current_last_value = int(get_field_from_row(get_last_lines_file(fn), 0))
+        except TypeError:
+            current_last_value = 1
+        except ValueError:
+            current_last_value = 1
+
+        if job_config and job_config.get(table) and job_config.get(table).get('last_value') >= current_last_value:
+            current_last_value = job_config.get(table).get('last_value')
+            log.info("No new data, not uploading to S3.")
+            upload = False
+        if not job_config:
+            job_config = collections.defaultdict(dict)
+            # Update job stats
+        if not job_config.get(table):
+            job_config[table] = {}
+        job_config[table]['last_updated'] = get_current_time().strftime('%Y-%m-%d')
+        job_config[table]['check_column'] = 'id'
+        job_config[table]['last_value'] = current_last_value
+        json_out = json.dumps(job_config)
+        fp.write(json_out + "\n")
+    return upload
+
+
+def compress_file(fn, ext=".gz"):
+    import gzip
+    f_in = open(fn, 'rb')
+    f_out = gzip.open(fn+ext, 'wb')
+    for line in f_in:
+        f_out.write(line)
+    f_out.close()
+    f_in.close()
+
+
+def get_field_from_row(rows, num, delimiter = ','):
+    last_value = None
+
+    for element in rows:
+        l = json.loads(element)
+        value=l[num]
+        last_value = value
+    return last_value
+
+def get_last_lines_file(fn, count=10):
+    return os.popen("tail -%d %s" % (count,fn)).readlines()
+
+def output_db_to_json(database, table, out_file, my_cnf = None, host = None, ignore_fields = ['response_guid'], incremental=False,
+                      check_column = "id",
+                      last_value = None):
+    dthandler = lambda obj: obj.strftime('%Y-%m-%d %H:%M:%S') if isinstance(obj, datetime.datetime) else None
+
+    conn = create_mysqldb_connection(database, host, my_cnf)
+    k = conn.cursor()
+    query = "select * from %s " % table[0]
+
+
+    if incremental:
+        if last_value:
+            query+=" where "+check_column+">"+str(last_value)
+        query+=" order by "+check_column
+#    print k.description
+
+    k.execute(query)
+
+    ignore_field_indexes = []
+
+    for i, tuple in enumerate(k.description):
+        if tuple[0] in ignore_fields:
+            ignore_field_indexes.append(i)
+
+    rows = k.fetchmany(CHUNK_SIZE)
+    fp = open(out_file,"w")
+    bad_rows = 0
+    total_rows = len(rows)
+    while len(rows) > 0:
+        for row in rows:
+            try:
+                json_row = json.dumps(row, default=dthandler)
+                fp.write(json_row+"\n")
+            except:
+#                print row
+                l = list(row)
+                for i in ignore_field_indexes:
+                    l[i] = None
+                try:
+                    json_row = json.dumps(l, default=dthandler)
+                    fp.write(json_row+"\n")
+                    print json.dumps(l, default=dthandler)
+                except:
+                    log.warn('Row:%s skipped'%row)
+                    bad_rows +=1
+        rows = k.fetchmany(CHUNK_SIZE)
+        total_rows +=len(rows)
+        if total_rows % 500000==0:
+            print "Rows:%d"%total_rows
+
+    print "Total bad rows:%d"%bad_rows
+    conn.close()
+    fp.close()
+
+def create_mysqldb_connection(database, host, my_cnf):
+    import MySQLdb
+    from MySQLdb import cursors
+
+    if not host:
+        host = LOCALHOST
+
+    if my_cnf:
+        c = MySQLdb.connect(host=host, read_default_file=my_cnf, db=database[0],  cursorclass = cursors.SSCursor)
+    else:
+        c = MySQLdb.connect(host=host, db=database[0],  cursorclass = cursors.SSCursor)
+
+    return c
+
+def output_db_table_columns(database, table, out_file, my_cnf = None, host = None):
+    c = create_mysqldb_connection(database, host, my_cnf)
+    k = c.cursor()
+    k.execute("select * from %s limit 1"%table[0])
+    fields =[]
+    #        print k.description
+    for t in k.description:
+        # The first entry in tuple is the field name
+        fields.append(t[0])
+
+    with open(out_file,"w") as of:
+        json.dump(fields, of)
 
 def get_current_time(utc=False):
     """Get the current time. This is broken out so we can monkey-patch
@@ -228,6 +427,21 @@ def parse_args(args):
         databases = None
         tables = None
 
+    job_config = None
+
+    if options.custom_mysql_query and not options.use_mysql:
+        parser.error("Custom Mysql queries only work if the 'use_mysql' option is used.")
+
+    if options.incremental:
+        if not options.job and not options.last_value:
+            parser.error('If you run in incremental mode, you need either a job (to read the last row value from) '
+                         'or need to specify it via the --last_value option.')
+        if options.job and os.path.isfile(options.job):
+            with open(options.job) as fp:
+                # Load the job config file as json
+                #job_config schema: key(table), values(last_updated, column, last_value)
+                job_config = json.load(fp)
+
     if has_table_field(s3_uri_format) and not tables:
         parser.error('If you use %T, you must specify one or more tables')
 
@@ -235,7 +449,7 @@ def parse_args(args):
         parser.error('If you use %D, you must specify one or more databases'
                      ' (use %d for day of month)')
 
-    return databases, tables, s3_uri_format, options
+    return databases, tables, s3_uri_format, options, job_config
 
 
 def connect_s3(boto_cfg=None, **kwargs):
@@ -278,7 +492,7 @@ def make_s3_key(s3_conn, s3_uri):
 def upload_multipart(s3_key, large_file):
     """Split up a large_file into chunks suitable for multipart upload, then
     upload each chunk."""
-    split_dir = tempfile.mkdtemp(prefix='s3mysqldump-split-')
+    split_dir = tempfile.mkdtemp(prefix='s3mysqldump-split-', dir='.')
     split_prefix = "%s/part-" % split_dir
 
     args = ['split', "--line-bytes=%u" % S3_MAX_PUT_SIZE, '--suffix-length=4',
@@ -323,15 +537,49 @@ def make_option_parser():
         ' http://code.google.com/p/boto/wiki/BotoConfig for details. You'
         ' can also pass in S3 credentials by setting the environment'
         ' variables AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.')
+    option_parser.add_option('--custom-out-dir', dest='custom_out_dir', default=None,
+        help='Directory to store custom output file. This should have be in a folder that'+
+        ' the mysql user has write permissions on so that mysqldump can work. Even if' +
+        ' selecting this option, you still need to pass in -M --fields-enclosed-by .. to the script.' +
+        ' This is useful when you need data to be in csv or a comparable format')
+    option_parser.add_option(
+        '--custom-mysql-query', dest='custom_mysql_query', default=None,
+        help='Custom table query for mysql. Useful for skipping fields')
+    option_parser.add_option('--compress', dest='compress', default=False, action="store_true",
+        help='Compresses the data file. Useful for large tables.')
+    option_parser.add_option('--db-host', dest='db_host', default=None,
+        help='DB host name. This is particularly needed for header output.')
+    option_parser.add_option(
+        '--dry-run', dest='dry_run', default=False, action='store_true',
+        help='Do the mysql dump but dont upload to s3.')
     option_parser.add_option(
         '-f', '--force', dest='force', default=False, action='store_true',
         help='Overwrite existing keys on S3')
+    option_parser.add_option(
+        '--header-output', dest='header_output', default=False, action='store_true',
+        help='Upload only the headers for the table.')
+    option_parser.add_option(
+        '--incremental', dest='incremental', default=False, action='store_true',
+        help='Work in incremental mode. The id column is used as default, unless a value is specified under check_column.')
+    option_parser.add_option(
+        '--check-column', dest='check_column', default='id',
+        help='Column to check for incremental imports.')
+    option_parser.add_option(
+        '--last-value', dest='last_value',
+        help='Useful for incremental imports. Uses last value provided when working incrementally.')
+    option_parser.add_option(
+        '--job', dest='job',
+        help='Save/read job output to/from the specified file. Useful for incremental imports.')
     option_parser.add_option(
         '-m', '--my-cnf', dest='my_cnf', default=None,
         help='Alternate path to my.cnf (for MySQL credentials). See' +
         ' http://dev.mysql.com/doc/refman/5.5/en/option-files.html for' +
         ' details. You can also specify this path in the environment'
         ' variable MY_CNF.')
+    option_parser.add_option(
+        '--mysql-bin', dest='mysql_bin',
+        default=DEFAULT_MYSQL_BIN,
+        help='Use Mysql instead of Mysqldump')
     option_parser.add_option(
         '--mysqldump-bin', dest='mysqldump_bin',
         default=DEFAULT_MYSQLDUMP_BIN,
@@ -341,6 +589,8 @@ def make_option_parser():
         default=[], action='append',
         help='extra args to pass to mysqldump (e.g. "-e --comment -vvv").'
         ' Use -m (see above) for passwords and other credentials.')
+    option_parser.add_option('--post-proc-script', dest="post_proc_script",
+        default = None, help = 'Post processor script after mysql/mysqldump extraction.')
     option_parser.add_option(
         '-q', '--quiet', dest='quiet', default=False,
         action='store_true',
@@ -362,6 +612,12 @@ def make_option_parser():
     option_parser.add_option(
         '--utc', dest='utc', default=False, action='store_true',
         help='Use UTC rather than local time to process s3_uri_format')
+    option_parser.add_option(
+        '--use-mysql', dest='use_mysql', default=False, action='store_true',
+        help='Use Mysql instead of mysqldump')
+    option_parser.add_option(
+        '--convert-to-json', dest='convert_to_json', default=False, action='store_true',
+        help='Convert tuples to json using python mysqldb api.')
     option_parser.add_option(
         '-v', '--verbose', dest='verbose', default=False,
         action='store_true',
@@ -428,10 +684,12 @@ def parse_opts(list_of_opts):
     return results
 
 
-def mysqldump_to_file(file, databases=None, tables=None, mysqldump_bin=None,
-                      my_cnf=None, extra_opts=None, single_row_format=False):
+def mysqldump_to_file(file, databases=None, tables=None, host=None, exe=None, use_mysql=False, custom_mysql_query = None,
+                      my_cnf=None, extra_opts=None, single_row_format=False, tab_output=False, post_proc_script = None,
+                      incremental = False, check_column=None, last_value = None):
     """Run mysqldump on a single table and dump it to a file
 
+    :param string host: Hostname of the mysql server
     :param string file: file object to dump to
     :param databases: sequence of MySQL database names, or ``None`` for all
                       databases
@@ -463,7 +721,8 @@ def mysqldump_to_file(file, databases=None, tables=None, mysqldump_bin=None,
             'If you specify tables you must specify exactly one database')
 
     args = []
-    args.append(mysqldump_bin or DEFAULT_MYSQLDUMP_BIN)
+
+    args.append(exe)
 
     # --defaults-file apparently has to go before any other options
     if my_cnf:
@@ -484,10 +743,29 @@ def mysqldump_to_file(file, databases=None, tables=None, mysqldump_bin=None,
         args.extend(databases)
     else:
         assert len(databases) == 1
-        args.append('--tables')
-        args.append('--')
+        if not use_mysql:
+            args.append('--tables')
+            args.append('--')
         args.append(databases[0])
-        args.extend(tables)
+
+        if use_mysql:
+            args.append("-h")
+            args.append(host)
+            args.append("-e")
+            if custom_mysql_query:
+                args.append(custom_mysql_query)
+            else:
+                query = "select * from %s "%tables[0]
+                if incremental:
+                    if last_value:
+                        query+=" where "+check_column+">"+str(last_value)
+                    query+=" order by "+check_column
+                args.append(query)
+        else:
+            args.extend(tables)
+
+    if tab_output:
+        file = None
 
     # do it!
     log.debug('  %s > %s' % (
@@ -496,8 +774,19 @@ def mysqldump_to_file(file, databases=None, tables=None, mysqldump_bin=None,
 
     start = time.time()
 
-    returncode = subprocess.call(args, stdout=file)
+    log.debug('args >%s'%args)
 
+    if tab_output:
+        returncode = subprocess.call(args)
+    else:
+        if post_proc_script:
+            fp, fn = tempfile.mkstemp(prefix='s3mysqldump-pre-proc', dir=".")
+            subprocess.call(args, stdout=fp)
+            returncode = subprocess.call([post_proc_script, fn], stdout=file)
+            if os.path.isfile(fn):
+                os.remove(fn)
+        else:
+            returncode = subprocess.call(args, stdout=file)
     if returncode:
         log.debug('  Failed with returncode %d' % returncode)
     else:
