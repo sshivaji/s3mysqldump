@@ -121,14 +121,14 @@ def main(args):
 
             output_db_to_structured(databases, tables, fn, my_cnf = options.my_cnf, host=options.db_host, incremental=options.incremental,
                                     check_column = check_column,
-                                    last_value = options.last_value, format='json', headers = headers)
+                                    last_value = options.last_value, format='json', headers = headers, header_plain=options.header_plain)
             success = True
 
         elif options.convert_to_csv:
 
             output_db_to_structured(databases, tables, fn, my_cnf = options.my_cnf, host=options.db_host, incremental=options.incremental,
                                     check_column = check_column,
-                                    last_value = options.last_value, format='csv', headers = headers)
+                                    last_value = options.last_value, format='csv', headers = headers, header_plain=options.header_plain)
             success = True
 
         else:
@@ -261,7 +261,7 @@ def get_last_lines_file(fn, count=10):
 
 def output_db_to_structured(database, table, out_file, my_cnf = None, host = None, ignore_fields = ['response_guid'], incremental=False,
                             check_column = "id",
-                            last_value = None, format='csv', headers = None):
+                            last_value = None, format='csv', headers = None, header_plain = False):
     dthandler = lambda obj: obj.strftime('%Y-%m-%d %H:%M:%S') if isinstance(obj, datetime.datetime) else None
 
     conn = create_mysqldb_connection(database, host, my_cnf)
@@ -293,8 +293,10 @@ def output_db_to_structured(database, table, out_file, my_cnf = None, host = Non
         csv_row_writer = csv.writer(fp, delimiter=',',
                                 quotechar='"', quoting=csv.QUOTE_NONNUMERIC)
         if headers:
-            csv_row_writer.writerow(headers)
-            # csv_row_writer.dialect.quoting=csv.QUOTE_NONNUMERIC
+            if header_plain:
+                fp.write(','.join(headers)+'\n')
+            else:
+                csv_row_writer.writerow(headers)
 
     while len(rows) > 0:
         for row in rows:
@@ -596,6 +598,10 @@ def make_option_parser():
     option_parser.add_option(
         '--header-output', dest='header_output', default=False, action='store_true',
         help='Upload the headers for the table.')
+    option_parser.add_option(
+        '--header-plain', dest='header_plain', default=False, action='store_true',
+        help='Output a plain header (no quotes)')
+
     option_parser.add_option(
         '--incremental', dest='incremental', default=False, action='store_true',
         help='Work in incremental mode. The id column is used as default, unless a value is specified under check_column.')
