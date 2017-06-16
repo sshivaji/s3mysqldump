@@ -122,11 +122,9 @@ def main(args):
             output_db_to_structured(databases, tables, fn, my_cnf = options.my_cnf, host=options.db_host, incremental=options.incremental,
                                     check_column = check_column,
                                     last_value = options.last_value, format='json', headers = headers)
-
             success = True
 
         elif options.convert_to_csv:
-
 
             output_db_to_structured(databases, tables, fn, my_cnf = options.my_cnf, host=options.db_host, incremental=options.incremental,
                                     check_column = check_column,
@@ -290,19 +288,24 @@ def output_db_to_structured(database, table, out_file, my_cnf = None, host = Non
     fp = open(out_file,"w")
     bad_rows = 0
     total_rows = len(rows)
-
-    csv_row_writer = csv.writer(fp, delimiter=',',
-                            quotechar='"', quoting=csv.QUOTE_NONNUMERIC)
-    if headers:
-        csv_row_writer.writerow(headers)
+    csv_row_writer = None
+    if format == 'csv':
+        csv_row_writer = csv.writer(fp, delimiter=',',
+                                quotechar='"', quoting=csv.QUOTE_NONNUMERIC)
+        if headers:
+            csv_row_writer.writerow(headers)
+            # csv_row_writer.dialect.quoting=csv.QUOTE_NONNUMERIC
 
     while len(rows) > 0:
         for row in rows:
             try:
 
                 # json_row = json.dumps(row, default=dthandler)
-                csv_row_writer.writerow(row)
-                # fp.write(json_row+"\n")
+                if format == 'csv':
+                    csv_row_writer.writerow(row)
+                elif format == 'json':
+                    json_row = json.dumps(row, default=dthandler)
+                    fp.write(json_row+"\n")
             except:
 # #                print row
 #                 l = list(row)
