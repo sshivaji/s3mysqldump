@@ -38,14 +38,14 @@ import collections
 
 import boto
 import boto.pyami.config
+import csv
+
 try:
     import simplejson as json  # preferred because of C speedups
 except ImportError:
     import json  # built in to Python 2.6 and later
 
-
 log = logging.getLogger('s3mysqldump')
-
 
 DEFAULT_MYSQLDUMP_BIN = 'mysqldump'
 DEFAULT_MYSQL_BIN = 'mysql'
@@ -112,13 +112,27 @@ def main(args):
             options.last_value = job_config[table]["last_value"]
 
         if options.header_output:
-            output_db_table_columns(databases, tables, fn, my_cnf = options.my_cnf, host=options.db_host)
+            headers = get_db_table_columns(databases, tables, fn, my_cnf=options.my_cnf, host=options.db_host,
+                                           format='csv')
+        else:
+            headers = None
+
+        if options.convert_to_json:
+
+            output_db_to_structured(databases, tables, fn, my_cnf = options.my_cnf, host=options.db_host, incremental=options.incremental,
+                                    check_column = check_column,
+                                    last_value = options.last_value, format='json', headers = headers)
+
             success = True
-        elif options.convert_to_json:
-            output_db_to_json(databases, tables, fn, my_cnf = options.my_cnf, host=options.db_host, incremental=options.incremental,
-                check_column = check_column,
-                last_value = options.last_value)
+
+        elif options.convert_to_csv:
+
+
+            output_db_to_structured(databases, tables, fn, my_cnf = options.my_cnf, host=options.db_host, incremental=options.incremental,
+                                    check_column = check_column,
+                                    last_value = options.last_value, format='csv', headers = headers)
             success = True
+
         else:
 
             if options.last_value and not options.use_mysql:
@@ -247,23 +261,24 @@ def get_field_from_row(rows, num, delimiter = ','):
 def get_last_lines_file(fn, count=10):
     return os.popen("tail -%d %s" % (count,fn)).readlines()
 
-def output_db_to_json(database, table, out_file, my_cnf = None, host = None, ignore_fields = ['response_guid'], incremental=False,
-                      check_column = "id",
-                      last_value = None):
+def output_db_to_structured(database, table, out_file, my_cnf = None, host = None, ignore_fields = ['response_guid'], incremental=False,
+                            check_column = "id",
+                            last_value = None, format='csv', headers = None):
     dthandler = lambda obj: obj.strftime('%Y-%m-%d %H:%M:%S') if isinstance(obj, datetime.datetime) else None
 
     conn = create_mysqldb_connection(database, host, my_cnf)
     k = conn.cursor()
     query = "select * from %s " % table[0]
 
-
     if incremental:
         if last_value:
-            query+=" where "+check_column+">"+str(last_value)
-        query+=" order by "+check_column
+            query += " where "+check_column+">"+str(last_value)
+        query += " order by "+check_column
 #    print k.description
 
     k.execute(query)
+    # headers = [h[0] for h in k.description]
+    # print("headers: {}".format(headers))
 
     ignore_field_indexes = []
 
@@ -275,25 +290,33 @@ def output_db_to_json(database, table, out_file, my_cnf = None, host = None, ign
     fp = open(out_file,"w")
     bad_rows = 0
     total_rows = len(rows)
+
+    csv_row_writer = csv.writer(fp, delimiter=',',
+                            quotechar='"', quoting=csv.QUOTE_NONNUMERIC)
+    if headers:
+        csv_row_writer.writerow(headers)
+
     while len(rows) > 0:
         for row in rows:
             try:
-                json_row = json.dumps(row, default=dthandler)
-                fp.write(json_row+"\n")
+
+                # json_row = json.dumps(row, default=dthandler)
+                csv_row_writer.writerow(row)
+                # fp.write(json_row+"\n")
             except:
-#                print row
-                l = list(row)
-                for i in ignore_field_indexes:
-                    l[i] = None
-                try:
-                    json_row = json.dumps(l, default=dthandler)
-                    fp.write(json_row+"\n")
-                    print json.dumps(l, default=dthandler)
-                except:
-                    log.warn('Row:%s skipped'%row)
-                    bad_rows +=1
+# #                print row
+#                 l = list(row)
+#                 for i in ignore_field_indexes:
+#                     l[i] = None
+#                 try:
+#                     json_row = json.dumps(l, default=dthandler)
+#                     fp.write(json_row+"\n")
+#                     print json.dumps(l, default=dthandler)
+#                 except:
+                log.warn('Row:%s skipped'%row)
+                bad_rows +=1
         rows = k.fetchmany(CHUNK_SIZE)
-        total_rows +=len(rows)
+        total_rows += len(rows)
         if total_rows % 500000==0:
             print "Rows:%d"%total_rows
 
@@ -315,18 +338,30 @@ def create_mysqldb_connection(database, host, my_cnf):
 
     return c
 
-def output_db_table_columns(database, table, out_file, my_cnf = None, host = None):
+def get_db_table_columns(database, table, out_file, my_cnf = None, host = None, format='json'):
     c = create_mysqldb_connection(database, host, my_cnf)
     k = c.cursor()
-    k.execute("select * from %s limit 1"%table[0])
-    fields =[]
+    k.execute("select * from %s limit 1" % table[0])
+    fields = []
     #        print k.description
     for t in k.description:
         # The first entry in tuple is the field name
         fields.append(t[0])
 
-    with open(out_file,"w") as of:
-        json.dump(fields, of)
+    return fields
+
+    # # print("fields: {}".format(fields))
+    # if format == 'json':
+    #     with open(out_file, "w") as of:
+    #         json.dump(fields, of)
+    #
+    # else:
+    #     with open(out_file, "w") as of:
+    #         csv_row_writer = csv.writer(of, delimiter=',',
+    #                                     quotechar='"', quoting=csv.QUOTE_NONNUMERIC)
+    #
+    #         csv_row_writer.writerow(fields)
+
 
 def get_current_time(utc=False):
     """Get the current time. This is broken out so we can monkey-patch
@@ -557,7 +592,7 @@ def make_option_parser():
         help='Overwrite existing keys on S3')
     option_parser.add_option(
         '--header-output', dest='header_output', default=False, action='store_true',
-        help='Upload only the headers for the table.')
+        help='Upload the headers for the table.')
     option_parser.add_option(
         '--incremental', dest='incremental', default=False, action='store_true',
         help='Work in incremental mode. The id column is used as default, unless a value is specified under check_column.')
@@ -618,6 +653,9 @@ def make_option_parser():
     option_parser.add_option(
         '--convert-to-json', dest='convert_to_json', default=False, action='store_true',
         help='Convert tuples to json using python mysqldb api.')
+    option_parser.add_option(
+        '--convert-to-csv', dest='convert_to_csv', default=False, action='store_true',
+        help='Convert tuples to csv using python mysqldb api.')
     option_parser.add_option(
         '-v', '--verbose', dest='verbose', default=False,
         action='store_true',
@@ -684,13 +722,13 @@ def parse_opts(list_of_opts):
     return results
 
 
-def mysqldump_to_file(file, databases=None, tables=None, host=None, exe=None, use_mysql=False, custom_mysql_query = None,
+def mysqldump_to_file(f, databases=None, tables=None, host=None, exe=None, use_mysql=False, custom_mysql_query = None,
                       my_cnf=None, extra_opts=None, single_row_format=False, tab_output=False, post_proc_script = None,
                       incremental = False, check_column=None, last_value = None):
     """Run mysqldump on a single table and dump it to a file
 
     :param string host: Hostname of the mysql server
-    :param string file: file object to dump to
+    :param string f: file object to dump to
     :param databases: sequence of MySQL database names, or ``None`` for all
                       databases
     :param tables: sequences of MySQL table names, or ``None`` for all tables.
@@ -758,19 +796,19 @@ def mysqldump_to_file(file, databases=None, tables=None, host=None, exe=None, us
                 query = "select * from %s "%tables[0]
                 if incremental:
                     if last_value:
-                        query+=" where "+check_column+">"+str(last_value)
-                    query+=" order by "+check_column
+                        query += " where "+check_column+">"+str(last_value)
+                    query += " order by "+check_column
                 args.append(query)
         else:
             args.extend(tables)
 
     if tab_output:
-        file = None
+        f = None
 
     # do it!
     log.debug('  %s > %s' % (
         ' '.join(pipes.quote(arg) for arg in args),
-        getattr(file, 'name', None) or repr(file)))
+        getattr(f, 'name', None) or repr(f)))
 
     start = time.time()
 
@@ -782,11 +820,11 @@ def mysqldump_to_file(file, databases=None, tables=None, host=None, exe=None, us
         if post_proc_script:
             fp, fn = tempfile.mkstemp(prefix='s3mysqldump-pre-proc', dir=".")
             subprocess.call(args, stdout=fp)
-            returncode = subprocess.call([post_proc_script, fn], stdout=file)
+            returncode = subprocess.call([post_proc_script, fn], stdout=f)
             if os.path.isfile(fn):
                 os.remove(fn)
         else:
-            returncode = subprocess.call(args, stdout=file)
+            returncode = subprocess.call(args, stdout=f)
     if returncode:
         log.debug('  Failed with returncode %d' % returncode)
     else:
