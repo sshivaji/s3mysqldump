@@ -20,7 +20,7 @@ The following command dumps 'user' table in 'db' database to s3 bucket s3://emr-
 To export to CSV on s3
 =======================
 
-python s3mysqldump.py --convert-to-csv --use-mysql <db name> <table name> <s3 location> --db-host=<db host location> -m ~/.my.cnf --compress --header-output --header-plain
+``python s3mysqldump.py --convert-to-csv --use-mysql <db name> <table name> <s3 location> --db-host=<db host location> -m ~/.my.cnf --compress --header-output --header-plain``
 
 Where .my.cnf can contain 
 ``[client]
